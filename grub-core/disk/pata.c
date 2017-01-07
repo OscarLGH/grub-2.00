@@ -25,6 +25,7 @@
 #ifndef GRUB_MACHINE_MIPS_QEMU_MIPS
 #include <grub/pci.h>
 #include <grub/cs5536.h>
+#include <grub/term.h>
 #else
 #define GRUB_MACHINE_PCI_IO_BASE  0xb4000000
 #endif
@@ -35,6 +36,8 @@ GRUB_MOD_LICENSE ("GPLv3+");
 /* At the moment, only two IDE ports are supported.  */
 static const grub_port_t grub_pata_ioaddress[] = { GRUB_ATA_CH0_PORT1,
 						   GRUB_ATA_CH1_PORT1 };
+static const grub_port_t grub_pata_ioaddress2[] = { GRUB_ATA_CH0_PORT2,
+						   GRUB_ATA_CH1_PORT2 };
 
 struct grub_pata_device
 {
@@ -45,6 +48,9 @@ struct grub_pata_device
      found.  */
   grub_port_t ioaddress;
 
+  grub_port_t ioaddress2;
+  grub_port_t ioaddressbm;
+
   /* Two devices can be connected to a single cable.  Use this field
      to select device 0 (commonly known as "master") or device 1
      (commonly known as "slave").  */
@@ -53,6 +59,13 @@ struct grub_pata_device
   int present;
 
   struct grub_pata_device *next;
+};
+
+struct grub_ata_prd
+{
+	unsigned int  base_address;
+	unsigned short  byte_count;
+	unsigned short  end_of_table;
 };
 
 static struct grub_pata_device *grub_pata_devices;
@@ -67,6 +80,30 @@ static inline grub_uint8_t
 grub_pata_regget (struct grub_pata_device *dev, int reg)
 {
   return grub_inb (dev->ioaddress + reg);
+}
+
+static inline void
+grub_pata_regset2(struct grub_pata_device *dev, int reg, int val)
+{
+	grub_outb(val, dev->ioaddress2 + reg);
+}
+
+static inline grub_uint8_t
+grub_pata_regget2(struct grub_pata_device *dev, int reg)
+{
+	return grub_inb(dev->ioaddress2 + reg);
+}
+
+static inline void
+grub_pata_regset3(struct grub_pata_device *dev, int reg, int val)
+{
+	grub_outb(val, dev->ioaddressbm + reg);
+}
+
+static inline grub_uint8_t
+grub_pata_regget3(struct grub_pata_device *dev, int reg)
+{
+	return grub_inb(dev->ioaddressbm + reg);
 }
 
 /* Wait for !BSY.  */
@@ -107,6 +144,7 @@ grub_pata_check_ready (struct grub_pata_device *dev, int spinup)
   return GRUB_ERR_NONE;
 }
 
+
 static inline void
 grub_pata_wait (void)
 {
@@ -120,6 +158,7 @@ grub_pata_wait (void)
 #define grub_ata_to_cpu16 grub_le_to_cpu16
 #define grub_cpu_to_ata16 grub_cpu_to_le16
 #endif
+
 
 static void
 grub_pata_pio_read (struct grub_pata_device *dev, char *buf, grub_size_t size)
@@ -136,6 +175,7 @@ grub_pata_pio_read (struct grub_pata_device *dev, char *buf, grub_size_t size)
 						       + GRUB_ATA_REG_DATA));
 }
 
+
 static void
 grub_pata_pio_write (struct grub_pata_device *dev, char *buf, grub_size_t size)
 {
@@ -145,6 +185,192 @@ grub_pata_pio_write (struct grub_pata_device *dev, char *buf, grub_size_t size)
   for (i = 0; i < size / 2; i++)
     grub_outw(grub_cpu_to_ata16 (grub_get_unaligned16 (buf + 2 * i)), dev->ioaddress + GRUB_ATA_REG_DATA);
 }
+
+
+//#define ATA_DBG
+
+static grub_err_t
+grub_pata_dma_readwrite(struct grub_ata *disk,
+struct grub_disk_ata_pass_through_parms *parms,
+	int spinup)
+{
+#ifdef ATA_DBG
+	grub_printf("%s\n", __FUNCTION__);
+	grub_refresh();
+#endif
+	int i;
+	struct grub_pata_device *dev = (struct grub_pata_device *) disk->data;
+
+	//build PRD table
+	struct grub_ata_prd * prd_base_address = (struct grub_ata_prd *)grub_malloc(0x10000);
+	memset(prd_base_address, 0, 0x10000);
+	struct grub_ata_prd * prd_tmp_address = prd_base_address;
+	char * buf = parms->buffer;
+
+#ifdef ATA_DBG
+	grub_printf("prd_base_address = %p, buf = %p\n", prd_base_address, buf);
+	grub_printf("pata_pass_through: cmd=0x%x, features=0x%x, sectors=0x%x\n",
+		parms->taskfile.cmd,
+		parms->taskfile.features,
+		parms->taskfile.sectors);
+	grub_printf("lba_high=0x%x, lba_mid=0x%x, lba_low=0x%x, size=%x\n",
+		(unsigned int)parms->taskfile.lba_high,
+		(unsigned int)parms->taskfile.lba_mid,
+		(unsigned int)parms->taskfile.lba_low, (unsigned int)parms->size);
+	grub_getkey();
+	grub_refresh();
+#endif
+
+	//int prd_num = 1 + ((size * 512) >> 16);
+	
+	unsigned byte_remaining = parms->size;
+	
+	while (byte_remaining != 0)
+	{
+		if (byte_remaining <= 0x10000) {
+			prd_tmp_address->base_address = (unsigned long)buf;
+			prd_tmp_address->byte_count = byte_remaining;
+			prd_tmp_address->end_of_table = 0x8000;
+
+#ifdef ATA_DBG
+
+			grub_printf("prd_tmp_address->base_address = %p\n", (void *)(unsigned long)prd_tmp_address->base_address);
+			grub_printf("prd_tmp_address->byte_count = %d\n", prd_tmp_address->byte_count);
+			grub_printf("prd_tmp_address->end_of_table = %x\n", prd_tmp_address->end_of_table);
+			grub_refresh();
+#endif
+			break;
+		}
+
+		prd_tmp_address->base_address = (unsigned long)buf;
+		prd_tmp_address->byte_count = 0x0;
+		prd_tmp_address->end_of_table = 0;
+
+#ifdef ATA_DBG
+
+		grub_printf("prd_tmp_address->base_address = %p\n", (void *)(unsigned long)prd_tmp_address->base_address);
+		grub_printf("prd_tmp_address->byte_count = %d\n", prd_tmp_address->byte_count);
+		grub_printf("prd_tmp_address->end_of_table = %x\n", prd_tmp_address->end_of_table);
+		grub_refresh();
+#endif
+
+		byte_remaining -= 0x10000;
+		buf += 0x10000;
+		prd_tmp_address++;
+	}
+
+	// Start to enable the DMA operation
+	grub_pata_regset(dev, GRUB_ATA_REG_DISK, 0xE0 | dev->device << 4);
+
+	//Enable interrupt to support UDMA
+	grub_pata_regset2(dev, GRUB_ATA_REG2_CONTROL, 0);
+
+	//Read BMIS register and clear ERROR and INTR bit
+	unsigned char reg_value = grub_pata_regget3(dev, GRUB_ATA_REG_BMIS);
+	reg_value |= (BMIS_INTERRUPT | BMIS_ERROR);
+	grub_pata_regset3(dev, GRUB_ATA_REG_BMIS, reg_value);
+
+	// Set the base address to BMID register
+	grub_outl((unsigned long)prd_base_address, dev->ioaddressbm + GRUB_ATA_REG_BMID);
+
+	// Set BMIC register to identify the operation direction
+	reg_value = grub_pata_regget3(dev, GRUB_ATA_REG_BMIC);
+	if (!parms->write)
+	{
+		reg_value |= BMIC_NREAD;
+	}
+	else
+	{
+		reg_value &= ~((unsigned char)BMIC_NREAD);
+	}
+	grub_pata_regset3(dev, GRUB_ATA_REG_BMIC, reg_value);
+
+	if (grub_pata_wait_not_busy(dev, GRUB_ATA_TOUT_DATA))
+		return grub_errno;
+
+	/* Set registers.  */
+	grub_pata_regset(dev, GRUB_ATA_REG_DISK, (dev->device << 4)
+		| (parms->taskfile.disk & 0xef));
+	if (grub_pata_check_ready(dev, spinup))
+		return grub_errno;
+
+	for (i = GRUB_ATA_REG_SECTORS; i <= GRUB_ATA_REG_LBAHIGH; i++)
+		grub_pata_regset(dev, i,
+			parms->taskfile.raw[7 + (i - GRUB_ATA_REG_SECTORS)]);
+	for (i = GRUB_ATA_REG_FEATURES; i <= GRUB_ATA_REG_LBAHIGH; i++)
+		grub_pata_regset(dev, i, parms->taskfile.raw[i - GRUB_ATA_REG_FEATURES]);
+	
+	/* Send read/write command. */
+	grub_pata_regset(dev, GRUB_ATA_REG_CMD, parms->taskfile.cmd);
+
+	//if (grub_pata_wait_not_busy(dev, GRUB_ATA_TOUT_DATA))
+	//	return grub_errno;
+	
+#ifdef ATA_DBG
+	grub_printf("Status = %x\n", reg_value);
+	grub_refresh();
+#endif
+
+	/* Set START bit of BMIC register. */
+	reg_value = grub_pata_regget3(dev, GRUB_ATA_REG_BMIC);
+	reg_value |= BMIC_START;
+	grub_pata_regset3(dev, GRUB_ATA_REG_BMIC, reg_value);
+
+	/* Wait DMA Interrupt... */
+	while (1)
+	{
+		reg_value = grub_pata_regget(dev, GRUB_ATA_REG_STATUS);
+		//grub_printf("Status = %x\n", reg_value);
+
+		reg_value = grub_pata_regget3(dev, GRUB_ATA_REG_BMIS);
+		if ((reg_value & BMIS_ERROR) != 0)
+		{
+			grub_errno = -7;
+			grub_printf("Dma Transfer Error!\n");
+			grub_refresh();
+			break;
+		}
+		if ((reg_value & BMIS_INTERRUPT) != 0)
+			break;
+
+	}
+
+	/* Wait for !BSY.  */
+	if (grub_pata_wait_not_busy(dev, GRUB_ATA_TOUT_DATA))
+		return grub_errno;
+
+	/* Return registers.  */
+	for (i = GRUB_ATA_REG_ERROR; i <= GRUB_ATA_REG_STATUS; i++)
+		parms->taskfile.raw[i - GRUB_ATA_REG_FEATURES] = grub_pata_regget(dev, i);
+	
+	
+	/* Read Status Register of IDE device to clear interrupt. */
+	
+	reg_value = grub_pata_regget(dev, GRUB_ATA_REG_STATUS);
+
+	// Clear START bit of BMIC register
+	reg_value = grub_pata_regget3(dev, GRUB_ATA_REG_BMIC);
+	reg_value &= ~((unsigned char)BMIC_START);
+	grub_pata_regset3(dev, GRUB_ATA_REG_BMIC, reg_value);
+
+	grub_free(prd_base_address);
+
+
+#ifdef ATA_DBG
+	unsigned int index;
+	//grub_printf("Sector %d, Buffer:\n", (int)sector);
+	for (index = 0; index < GRUB_DISK_SECTOR_SIZE; index++)
+	{
+		grub_printf("%02x", (unsigned char)buf[index]);
+	}
+	grub_printf("\n");
+	grub_refresh();
+	//grub_getkey();
+#endif
+	//grub_millisleep(10);
+	return 0;
+}
+
 
 /* ATA pass through support, used by hdparm.mod.  */
 static grub_err_t
@@ -170,6 +396,12 @@ grub_pata_readwrite (struct grub_ata *disk,
 	        parms->taskfile.lba_mid,
 	        parms->taskfile.lba_low, parms->size);
 
+  if (parms->taskfile.cmd == GRUB_ATA_CMD_READ_SECTORS_DMA ||
+	  parms->taskfile.cmd == GRUB_ATA_CMD_READ_SECTORS_DMA_EXT ||
+	  parms->taskfile.cmd == GRUB_ATA_CMD_WRITE_SECTORS_DMA ||
+	  parms->taskfile.cmd == GRUB_ATA_CMD_WRITE_SECTORS_DMA_EXT
+	  )
+	  return grub_pata_dma_readwrite(disk, parms, spinup);
   /* Set registers.  */
   grub_pata_regset (dev, GRUB_ATA_REG_DISK, (dev->device << 4)
 		    | (parms->taskfile.disk & 0xef));
@@ -306,7 +538,7 @@ check_device (struct grub_pata_device *dev)
 }
 
 static grub_err_t
-grub_pata_device_initialize (int port, int device, int addr)
+grub_pata_device_initialize (int port, int device, int addr, int addr2, int addr3)
 {
   struct grub_pata_device *dev;
   struct grub_pata_device **devp;
@@ -323,6 +555,8 @@ grub_pata_device_initialize (int port, int device, int addr)
   dev->port = port;
   dev->device = device;
   dev->ioaddress = addr + GRUB_MACHINE_PCI_IO_BASE;
+  dev->ioaddress2 = addr2 + GRUB_MACHINE_PCI_IO_BASE;
+  dev->ioaddressbm = addr3 + GRUB_MACHINE_PCI_IO_BASE;
   dev->present = 1;
   dev->next = NULL;
 
@@ -347,7 +581,11 @@ grub_pata_pciinit (grub_pci_device_t dev,
   grub_uint32_t class;
   grub_uint32_t bar1;
   grub_uint32_t bar2;
+  grub_uint32_t bar3;
   int rega;
+  int regb;
+  int regc = 0;
+
   int i;
   static int controller = 0;
   int cs5536 = 0;
@@ -380,12 +618,19 @@ grub_pata_pciinit (grub_pci_device_t dev,
 	compat = (class >> (8 + 2 * i)) & 1;
 
       rega = 0;
+	  regb = 0;
 
+	  addr = grub_pci_make_address(dev, GRUB_PCI_REG_ADDRESSES
+		  + sizeof(grub_uint64_t) * 2
+		  );
+	  bar3 = grub_pci_read(addr);
+	  regc = bar3 & ~3;
       /* If the channel is in compatibility mode, just assign the
 	 default registers.  */
       if (compat == 0 && !compat_use[i])
 	{
 	  rega = grub_pata_ioaddress[i];
+	  regb = grub_pata_ioaddress2[i];
 	  compat_use[i] = 1;
 	}
       else if (compat)
@@ -415,7 +660,7 @@ grub_pata_pciinit (grub_pci_device_t dev,
       if (rega)
 	{
 	  grub_errno = GRUB_ERR_NONE;
-	  grub_pata_device_initialize (controller * 2 + i, 0, rega);
+	  grub_pata_device_initialize (controller * 2 + i, 0, rega, regb, regc);
 
 	  /* Most errors raised by grub_ata_device_initialize() are harmless.
 	     They just indicate this particular drive is not responding, most
@@ -427,7 +672,7 @@ grub_pata_pciinit (grub_pci_device_t dev,
 	      grub_errno = GRUB_ERR_NONE;
 	    }
 
-	  grub_pata_device_initialize (controller * 2 + i, 1, rega);
+	  grub_pata_device_initialize (controller * 2 + i, 1, rega, regb, regc);
 
 	  /* Likewise.  */
 	  if (grub_errno)
@@ -492,7 +737,7 @@ grub_pata_open (int id, int devnum, struct grub_ata *ata)
     return err;
 
   ata->data = devfnd;
-  ata->dma = 0;
+  ata->dma = 1;
   ata->maxbuffer = 256 * 512;
   ata->present = &devfnd->present;
 
@@ -530,10 +775,10 @@ grub_pata_iterate (int (*hook) (int id, int bus),
 
 
 static struct grub_ata_dev grub_pata_dev =
-  {
-    .iterate = grub_pata_iterate,
-    .open = grub_pata_open,
-    .readwrite = grub_pata_readwrite,
+{
+	.iterate = grub_pata_iterate,
+	.open = grub_pata_open,
+	.readwrite = grub_pata_readwrite
   };
 
 
